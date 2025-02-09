@@ -20,6 +20,7 @@ import gc
 import os
 import concurrent.futures
 from numba import njit, prange  # New import for Numba
+from tqdm import tqdm
 
 # Initialize logging
 logging.getLogger(__name__)
@@ -142,9 +143,10 @@ def fuzzy_entropy_feature_extraction(imfs_dict, m=2, r=0.15):
     """
     fe_values = {}
     processed_imfs = {}
-    for feature, imfs in imfs_dict.items():
+    
+    print("Computing fuzzy entropy for each IMF...")
+    for feature, imfs in tqdm(imfs_dict.items(), desc="Fuzzy Entropy"):
         processed_imfs[feature] = imfs
-        # Ensure imfs is at least 2D (if a single IMF, wrap it into an extra dimension)
         if imfs.ndim == 1:
             imfs = np.array([imfs])
         for i in range(imfs.shape[0]):
@@ -156,66 +158,43 @@ def composite_feature_creation(fe_values_dict, imfs_dict, fe_thresholds):
     """
     Groups IMFs based on their fuzzy entropy values and creates composite features.
     """
-    print("Starting composite feature creation.")
+    print("Creating composite features...")
     groups = {group: [] for group in fe_thresholds.keys()}
-    logging.debug(f"Initialized groups: {list(groups.keys())}")
     
-    try:
-        for key, fe_value in fe_values_dict.items():
-            if not isinstance(key, tuple):
-                print(f"Warning: key {key} is not a tuple. Skipping.")
-                continue
-            feature, imf_idx = key
-            try:
-                # Convert fe_value to a scalar if it isn't already
-                fe_scalar = fe_value
-                # If fe_scalar is a tuple or list, attempt to convert and average it
-                if isinstance(fe_scalar, (list, tuple)):
-                    try:
-                        fe_scalar = np.mean(np.array(fe_scalar))
-                    except Exception as e:
-                        print(f"Error converting fuzzy entropy value for feature {feature}, IMF {imf_idx}: {e}")
-                        continue
-                elif hasattr(fe_scalar, "ndim") and fe_scalar.ndim > 0:
-                    fe_scalar = np.mean(fe_scalar)
-
-                for group, threshold in fe_thresholds.items():
-                    if float(fe_scalar) < float(threshold):
-                        groups[group].append(imfs_dict[feature][imf_idx])
-                        break
-            except Exception as e:
-                print(f"Error processing IMF {imf_idx} for feature {feature}: {str(e)}")
-                continue
-        
-        # Create composite features
-        composite_features = {}
-        for group, imf_list in groups.items():
-            if imf_list:
-                print(f"Creating composite feature for group: {group} with {len(imf_list)} IMFs.")
-                composite_feature = np.mean(np.vstack(imf_list), axis=0)
-                composite_features[group] = composite_feature
-                print(f"Composite feature created for group: {group}. Shape: {composite_feature.shape}")
-            else:
-                logging.warning(f"No IMFs in group: {group}. Generating zeros for composite feature.")
-                # Find first valid IMF to get the correct length
-                T = None
-                for feature in imfs_dict:
-                    if imfs_dict[feature] is not None and len(imfs_dict[feature]) > 0:
-                        T = len(imfs_dict[feature][0])
-                        break
-                if T is None:
-                    raise ValueError("No valid IMFs found to determine feature length")
-                composite_features[group] = np.zeros(T)
-                print(f"Generated zero array for composite feature: {group}. Shape: {T}")
-        
-        composite_features_df = pd.DataFrame(composite_features)
-        gc.collect()
-        print("Composite feature creation completed. DataFrame shape: {}".format(composite_features_df.shape))
-        return composite_features_df
-        
-    except Exception as e:
-        print(f"Error in composite feature creation: {str(e)}")
-        raise
+    # Group IMFs by fuzzy entropy
+    print("Grouping IMFs by fuzzy entropy...")
+    for key, fe_value in tqdm(fe_values_dict.items(), desc="Grouping IMFs"):
+        if not isinstance(key, tuple):
+            print(f"Warning: key {key} is not a tuple. Skipping.")
+            continue
+        feature, imf_idx = key
+        try:
+            fe_scalar = fe_value if not isinstance(fe_value, (list, tuple)) else np.mean(fe_value)
+            for group, threshold in fe_thresholds.items():
+                if float(fe_scalar) < float(threshold):
+                    groups[group].append(imfs_dict[feature][imf_idx])
+                    break
+        except Exception as e:
+            print(f"Error processing IMF {imf_idx} for feature {feature}: {str(e)}")
+            continue
+    
+    # Create composite features
+    print("Computing composite features...")
+    composite_features = {}
+    for group in tqdm(groups.keys(), desc="Creating composites"):
+        imf_list = groups[group]
+        if imf_list:
+            composite_feature = np.mean(np.vstack(imf_list), axis=0)
+            composite_features[group] = composite_feature
+        else:
+            T = next(iter(imfs_dict.values()))[0].shape[0] if imfs_dict else None
+            if T is None:
+                raise ValueError("No valid IMFs found to determine feature length")
+            composite_features[group] = np.zeros(T)
+    
+    composite_features_df = pd.DataFrame(composite_features)
+    gc.collect()
+    return composite_features_df
 
 def correlation_based_feature_selection(dataframe, target_feature, mic_threshold=0.5):
     """
@@ -239,7 +218,7 @@ def correlation_based_feature_selection(dataframe, target_feature, mic_threshold
     y = dataframe[target_feature]
     
     print(f"Calculating MIC for {len(candidate_features)} candidate features against target feature: {target_feature}.")
-    for feature in candidate_features:
+    for feature in tqdm(candidate_features, desc="MIC Calculation"):
         x_feat = X[feature].values.reshape(-1, 1)
         logging.debug(f"Calculating MIC for feature: {feature}.")
         mic = mutual_info_regression(x_feat, y.values, random_state=0)[0]
@@ -254,32 +233,38 @@ def correlation_based_feature_selection(dataframe, target_feature, mic_threshold
 def integrate_features(original_dataframe, composite_features_df, selected_indicator_features, reference_columns=None):
     """
     Combines composite features with selected indicator features to produce the final feature matrix.
+    Ensures consistent feature selection across all files by using the same selected features.
     
     Parameters:
         original_dataframe (pd.DataFrame): The preprocessed original DataFrame.
         composite_features_df (pd.DataFrame): DataFrame containing composite features.
-        selected_indicator_features (list): List of selected indicator feature names.
+        selected_indicator_features (list): List of selected indicator feature names from first file.
         reference_columns (list): List of reference columns for reindexing.
     
     Returns:
         final_features_df (pd.DataFrame): Final feature matrix ready for modeling.
     """
     print("Starting feature integration.")
-    print(f"Selected indicator features: {selected_indicator_features}")
-    # Ensure that all selected features exist in the dataframe and fill with zeros if missing
-    missing_features = [feat for feat in selected_indicator_features if feat not in original_dataframe.columns]
-    if missing_features:
-        print(f"Warning: The following selected features are missing in the dataframe and will be filled with zeros: {missing_features}")
-    indicator_df = original_dataframe.copy()
-    for feat in selected_indicator_features:
-        if feat not in indicator_df.columns:
-            indicator_df[feat] = 0.0
-    indicator_df = indicator_df[selected_indicator_features].reset_index(drop=True)
+    print(f"Using selected indicator features from first file: {selected_indicator_features}")
     
+    indicator_df = pd.DataFrame()
+    
+    print("Integrating selected features...")
+    for feat in tqdm(selected_indicator_features, desc="Feature Integration"):
+        if feat in original_dataframe.columns:
+            indicator_df[feat] = original_dataframe[feat]
+        else:
+            print(f"Feature {feat} not found in current file, filling with zeros")
+            indicator_df[feat] = 0.0
+    
+    indicator_df = indicator_df.reset_index(drop=True)
     composite_features_df = composite_features_df.reset_index(drop=True)
+    
     final_features_df = pd.concat([indicator_df, composite_features_df], axis=1)
-    # If a reference columns list is provided, reindex to ensure the same feature set (fill missing with zeros)
+    
     if reference_columns is not None:
         final_features_df = final_features_df.reindex(columns=reference_columns, fill_value=0)
+    
     print("Features integrated. Final feature matrix shape: {}".format(final_features_df.shape))
+    print("Final feature columns:", final_features_df.columns.tolist())
     return final_features_df 

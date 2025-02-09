@@ -19,10 +19,8 @@ import psutil
 import pickle
 from sklearn.preprocessing import StandardScaler
 import glob
+from tqdm import tqdm
 
-print("here")
-# Add this line right here, at the very top of your executable code in main.py
-print("This is a test log from main.py at the very beginning!")
 
 # ---------------------------
 # I. Configuration Loading
@@ -41,58 +39,183 @@ print("Hyperparameters and settings loaded from config.")
 # ---------------------------
 # II. Data Loading and Preprocessing from Individual CSV Files
 # ---------------------------
-print("Processing CSV files from the processed folder individually...")
-processed_folder = 'data/processed'
-csv_files = glob.glob(os.path.join(processed_folder, '*.csv'))
-if not csv_files:
-    raise ValueError(f"No CSV files found in processed folder: {processed_folder}")
+print("Checking for cached processed features...")
+if not os.path.exists(config.output_dir):
+    os.makedirs(config.output_dir)
+features_cache_path = os.path.join(config.output_dir, "processed_features.pkl")
 
-from features.feature_engineering import (
-    variational_mode_decomposition,
-    determine_optimal_k,
-    fuzzy_entropy_feature_extraction,
-    composite_feature_creation,
-    correlation_based_feature_selection,
-    integrate_features
+if os.path.exists(features_cache_path):
+    print(f"Loading cached processed features from {features_cache_path}")
+    with open(features_cache_path, 'rb') as f:
+        cached_data = pickle.load(f)
+        full_features = cached_data['features']
+        full_target = cached_data['target']
+    print("Loaded cached features successfully.")
+    print("Combined feature matrix shape from cache:", full_features.shape)
+else:
+    print("No cached features found. Processing CSV files from the processed folder individually...")
+    processed_folder = 'data/processed'
+    csv_files = glob.glob(os.path.join(processed_folder, '*.csv'))
+    if not csv_files:
+        raise ValueError(f"No CSV files found in processed folder: {processed_folder}")
+
+    from features.feature_engineering import (
+        variational_mode_decomposition,
+        determine_optimal_k,
+        fuzzy_entropy_feature_extraction,
+        composite_feature_creation,
+        correlation_based_feature_selection,
+        integrate_features
+    )
+
+    def find_best_k(signal):
+        best_k = determine_optimal_k(signal, config.k_range, config.vmd_params_dict)
+        return best_k
+
+    def process_single_csv(file_path, selected_features=None, is_first_file=False, optimal_k_dict=None):
+        print(f"\nProcessing CSV file: {file_path}")
+        df = pd.read_csv(file_path)
+        imfs_dict = {}
+        
+        # Calculate optimal k only for the first file
+        if is_first_file:
+            optimal_k_dict = {}
+            print("Calculating optimal k values...")
+            for feature in tqdm(config.features_to_decompose, desc="Finding optimal k"):
+                if feature in df.columns:
+                    signal = df[feature].values.astype(np.float32)
+                    optimal_k = find_best_k(signal)
+                    optimal_k_dict[feature] = optimal_k
+        
+        # Process features using either calculated or provided optimal k values
+        print("Performing VMD decomposition...")
+        for feature in tqdm(config.features_to_decompose, desc="VMD Processing"):
+            if feature in df.columns:
+                signal = df[feature].values.astype(np.float32)
+                k_value = optimal_k_dict.get(feature)
+                if k_value is None:
+                    print(f"Warning: No optimal k found for {feature}, skipping")
+                    continue
+                
+                imfs = variational_mode_decomposition(
+                    signal, 
+                    K=k_value, 
+                    **{k: v for k, v in config.vmd_params_dict.items() if k not in ['K', 'chunk_size']}
+                )
+                imfs_dict[feature] = imfs.astype(np.float32)
+            else:
+                print(f"Warning: {feature} not found in {file_path}")
+        
+        print("Calculating fuzzy entropy...")
+        fe_values, processed_imfs = fuzzy_entropy_feature_extraction(imfs_dict)
+        
+        print("Creating composite features...")
+        composite_features = composite_feature_creation(fe_values, processed_imfs, config.fe_thresholds)
+        
+        if is_first_file:
+            print("Performing feature selection on first file...")
+            selected_features = correlation_based_feature_selection(df, config.target_feature)
+            print(f"Selected features from first file: {selected_features}")
+        
+        print("Integrating features...")
+        final_feature_matrix = integrate_features(df, composite_features, selected_features)
+        return final_feature_matrix, df[config.target_feature].values, selected_features, optimal_k_dict
+
+    # Process first file to get selected features and optimal k values
+    print("\nProcessing first file to determine optimal k values and selected features...")
+    first_file = csv_files[0]
+    first_features, first_target, selected_features, optimal_k_dict = process_single_csv(first_file, is_first_file=True)
+    feature_matrices = [first_features]
+    target_arrays = [first_target]
+
+    # Process remaining files using the same selected features and optimal k values
+    print("\nProcessing remaining files using parameters from first file...")
+    for csv_file in tqdm(csv_files[1:], desc="Processing files"):
+        features, target, _, _ = process_single_csv(
+            csv_file, 
+            selected_features=selected_features, 
+            is_first_file=False, 
+            optimal_k_dict=optimal_k_dict
+        )
+        feature_matrices.append(features)
+        target_arrays.append(target)
+
+    print("\nCombining all processed features...")
+    full_features = pd.concat(feature_matrices, ignore_index=True)
+    full_target = np.concatenate(target_arrays)
+    print("Combined feature matrix shape for training:", full_features.shape)
+    
+    # Save processed features to cache
+    print(f"Saving processed features to cache: {features_cache_path}")
+    with open(features_cache_path, 'wb') as f:
+        pickle.dump({
+            'features': full_features,
+            'target': full_target,
+        }, f)
+    print("Saved processed features to cache.")
+
+# ---------------------------
+# III. DataLoader Setup
+# ---------------------------
+print("Setting up data loaders...")
+
+# Scale features
+scaler = StandardScaler()
+scaled_features = scaler.fit_transform(full_features)
+scaled_features = torch.FloatTensor(scaled_features)
+full_target = torch.FloatTensor(full_target)
+
+# Create sequences for training
+def create_sequences(features, targets, seq_length, pred_length):
+    """Create sequences for time series prediction"""
+    X, y = [], []
+    for i in range(len(features) - seq_length - pred_length + 1):
+        X.append(features[i:(i + seq_length)])
+        y.append(targets[i + seq_length:i + seq_length + pred_length])
+    return torch.stack(X), torch.stack(y)
+
+# Create sequences
+print("Creating sequences...")
+X, y = create_sequences(scaled_features, full_target, seq_len, pred_len)
+print(f"Sequence shapes - X: {X.shape}, y: {y.shape}")
+
+# Split data into train and test sets
+train_size = int(0.8 * len(X))
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+print(f"Train/Test split - Train size: {len(X_train)}, Test size: {len(X_test)}")
+
+# Create DataLoader instances
+from torch.utils.data import TensorDataset, DataLoader
+
+train_dataset = TensorDataset(X_train, y_train)
+test_dataset = TensorDataset(X_test, y_test)
+
+train_dataloader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=0,  # Set to 0 for Apple Silicon
+    pin_memory=True if torch.backends.mps.is_available() else False
 )
 
-def process_single_csv(file_path):
-    print(f"Processing CSV file: {file_path}")
-    df = pd.read_csv(file_path)
-    optimal_k_dict = {}
-    imfs_dict = {}
-    for feature in config.features_to_decompose:
-        if feature in df.columns:
-            print(f"Processing VMD for feature: {feature}")
-            signal = df[feature].values.astype(np.float32)
-            optimal_k = determine_optimal_k(signal, config.k_range, config.vmd_params_dict)
-            optimal_k_dict[feature] = optimal_k
-            imfs = variational_mode_decomposition(
-                signal, 
-                K=optimal_k, 
-                **{k: v for k, v in config.vmd_params_dict.items() if k not in ['K', 'chunk_size']}
-            )
-            imfs_dict[feature] = imfs.astype(np.float32)
-        else:
-            print(f"Warning: {feature} not found in {file_path}")
-    fe_values, processed_imfs = fuzzy_entropy_feature_extraction(imfs_dict)
-    composite_features = composite_feature_creation(fe_values, processed_imfs, config.fe_thresholds)
-    selected_features = correlation_based_feature_selection(df, config.target_feature)
-    final_feature_matrix = integrate_features(df, composite_features, selected_features)
-    return final_feature_matrix, df[config.target_feature].values
+test_dataloader = DataLoader(
+    test_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=0,  # Set to 0 for Apple Silicon
+    pin_memory=True if torch.backends.mps.is_available() else False
+)
 
-feature_matrices = []
-target_arrays = []
-for csv_file in csv_files:
-    features, target = process_single_csv(csv_file)
-    feature_matrices.append(features)
-    target_arrays.append(target)
+print(f"Created dataloaders - Train batches: {len(train_dataloader)}, Test batches: {len(test_dataloader)}")
 
-full_features = pd.concat(feature_matrices, ignore_index=True)
-full_target = np.concatenate(target_arrays)
-print("Combined feature matrix shape for training:", full_features.shape)
-
-# Feature engineering already applied per CSV file. Using the processed features directly.
+# Save scaler for inference
+if not os.path.exists(config.output_dir):
+    os.makedirs(config.output_dir)
+scaler_path = os.path.join(config.output_dir, "feature_scaler.pkl")
+with open(scaler_path, "wb") as f:
+    pickle.dump(scaler, f)
+print(f"Saved feature scaler to {scaler_path}")
 
 # ---------------------------
 # IV. Model Initialization
@@ -100,9 +223,13 @@ print("Combined feature matrix shape for training:", full_features.shape)
 from models.lftsformer import EnhancedLFTSformer
 print("Imported EnhancedLFTSformer model.")
 
+# Get the actual feature dimension from the processed data
+actual_feature_dim = scaled_features.shape[1]
+print(f"Actual feature dimension from data: {actual_feature_dim}")
+
 print("Initializing EnhancedLFTSformer model.")
 model = EnhancedLFTSformer(
-    feature_dim=config.feature_dim,      # Number of input features
+    feature_dim=actual_feature_dim,      # Use actual feature dimension instead of config
     d_model=config.d_model,              # Hidden dimension
     d_ff=config.d_ff,                    # Feed-forward network hidden dimension
     n_heads=config.n_heads,              # Number of attention heads
@@ -114,7 +241,7 @@ model = EnhancedLFTSformer(
     timestamp_vocab_size=None            # Optional, set if you use timestamp embeddings
 )
 model = model.to(device)
-print("EnhancedLFTSformer model initialized and moved to device.")
+print(f"EnhancedLFTSformer model initialized with feature_dim={actual_feature_dim} and moved to device.")
 
 # Synchronize the prediction horizon. Use the model's actual prediction length.
 pred_len = model.pred_len
