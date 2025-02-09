@@ -147,3 +147,13 @@ VALIDATED_FILES['GOOG.csv'] = True  # Validated on 2025-02-05 14:17:33.861703
 
 
 logging.info("Configuration loaded successfully.")
+
+VALIDATED_FILES['CSCO.csv'] = True  # Validated on 2025-02-08 23:57:36.333042
+
+VALIDATED_FILES['BB.csv'] = True  # Validated on 2025-02-08 23:57:40.072743
+
+VALIDATED_FILES['AXP.csv'] = True  # Validated on 2025-02-08 23:57:49.505392
+
+VALIDATED_FILES['AVGO.csv'] = True  # Validated on 2025-02-08 23:57:52.821647
+
+VALIDATED_FILES['BABA.csv'] = True  # Validated on 2025-02-08 23:57:56.841227

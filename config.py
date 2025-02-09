@@ -23,10 +23,10 @@ config = {
         "timestamp_vocab_size": None
     },
     "training": {
-        "batch_size": 32,
-        "learning_rate": 1e-4,
-        "epochs": 50,
-        "early_stopping_patience": 5,
+        "batch_size": 64,
+        "learning_rate": 1e-5,
+        "epochs": 280,
+        "early_stopping_patience": 20,
         "gradient_clip_value": 1.0,
         "beta_initial": 0.5,  # For Dynamic Loss Function
         "c": 1.0
@@ -79,14 +79,14 @@ amsgrad = False
 gc_momentum = 0.5
 beta_initial = 0.5
 c = 1.0
-epochs = 100
-early_stopping_patience = 10
+epochs = 250
+early_stopping_patience = 50
 output_dir = "results/"
 
 # Add these configuration parameters to your config.py
 # Example configuration parameters - adjust values according to your needs
-batch_size = 32
-learning_rate = 0.001
+batch_size = 1024
+learning_rate = 0.00001
 seq_len = 12     # Input sequence length
 pred_len = 6     # Prediction length
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')

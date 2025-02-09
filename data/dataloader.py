@@ -135,6 +135,18 @@ def preprocess_data(raw_dataframe, features_to_use, target_feature):
     scaler = StandardScaler()
     # Exclude target_feature from scaling.
     feature_cols = train_df.columns.drop(target_feature)
+
+    # Sanity checks for data quality before scaling
+    nan_count = train_df[feature_cols].isna().sum().sum()
+    inf_count = np.isinf(train_df[feature_cols]).sum().sum()
+    if nan_count > 0 or inf_count > 0:
+        print(f"Warning: Training features contain {nan_count} NaNs and {inf_count} Infs.")
+
+    outlier_threshold = 1e6
+    outlier_count = (train_df[feature_cols].abs() > outlier_threshold).sum().sum()
+    if outlier_count > 0:
+        print(f"Warning: Training features contain {outlier_count} extreme outlier values (abs > {outlier_threshold}).")
+
     train_df[feature_cols] = scaler.fit_transform(train_df[feature_cols])
     test_df[feature_cols] = scaler.transform(test_df[feature_cols])
     print("Features standardized.")

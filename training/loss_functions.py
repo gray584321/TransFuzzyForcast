@@ -33,10 +33,14 @@ class DynamicLossFunction(nn.Module):
         """
         # Compute the residual
         z = predicted - target
-        # Example dynamic loss: |z|^beta + c * z^2
-        loss = torch.mean(torch.abs(z) ** self.beta + self.c * z**2)
-        return loss
+        abs_z = torch.abs(z)
+        loss = torch.where(
+            abs_z < self.beta,
+            0.5 * (z ** 2) / self.beta,
+            self.c * (abs_z - 0.5 * self.beta)
+        )
+        return torch.mean(loss)
 
     def get_current_beta(self):
-        """Returns the current beta value as a Python float"""
-        return self.beta.item() 
+        """Returns the current beta value"""
+        return self.beta 

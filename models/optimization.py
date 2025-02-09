@@ -7,7 +7,7 @@ before performing an optimizer step.
 """
 
 import torch
-import torch.optim as optim
+from torch.optim import Adam
 
 class GradientCentralization:
     def __init__(self, optimizer):
@@ -30,13 +30,20 @@ class GradientCentralization:
     def param_groups(self):
         return self.optimizer.param_groups
 
-def GCAdam(params, lr, weight_decay):
-    """
-    Instantiate a standard Adam optimizer and wrap it with gradient centralization.
-    """
-    # Instantiate a standard Adam optimizer using the provided learning rate and weight decay
-    adam_optimizer = optim.Adam(params, lr=lr, weight_decay=weight_decay)
-    # Wrap the Adam optimizer with our GradientCentralization class.
-    # This wrapper subtracts the mean gradient from parameters with multidimensional gradients (all except batch)
-    # in accordance with the guidelines in the notepad.
-    return GradientCentralization(adam_optimizer) 
+# Updated GCAdam: Now inherits from torch.optim.Adam so that it is recognized
+# as an optimizer by torch.optim.lr_scheduler and other components.
+class GCAdam(Adam):  # <-- Changed inheritance here.
+    def __init__(self, params, lr=1e-3, weight_decay=0, **kwargs):
+        super().__init__(params, lr=lr, weight_decay=weight_decay, **kwargs)
+
+    def step(self, closure=None):
+        # Before taking the optimization step, apply gradient centralization.
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                # Apply gradient centralization if the gradient has more than 1 dimension.
+                if p.grad.dim() > 1:
+                    # Subtract the mean of gradients along all dimensions except the first one.
+                    p.grad.data = p.grad.data - p.grad.data.mean(dim=tuple(range(1, p.grad.data.dim())), keepdim=True)
+        return super().step(closure) 

@@ -18,6 +18,7 @@ import gc
 import psutil
 import pickle
 from sklearn.preprocessing import StandardScaler
+import glob
 
 print("here")
 # Add this line right here, at the very top of your executable code in main.py
@@ -38,225 +39,60 @@ device = config.device
 print("Hyperparameters and settings loaded from config.")
 
 # ---------------------------
-# II. Data Loading and Preprocessing
+# II. Data Loading and Preprocessing from Individual CSV Files
 # ---------------------------
-# Import functions from data/dataloader.py
-from data.dataloader import load_raw_data, preprocess_data, create_dataloaders
-print("Dataloader functions imported.")
+print("Processing CSV files from the processed folder individually...")
+processed_folder = 'data/processed'
+csv_files = glob.glob(os.path.join(processed_folder, '*.csv'))
+if not csv_files:
+    raise ValueError(f"No CSV files found in processed folder: {processed_folder}")
 
-# Load the raw data using the path defined in config
-print("Loading raw data...")
-raw_df = load_raw_data(config.merged_data_path)
-print("Raw data loaded successfully.")
-
-# Preprocess the raw data: returns processed training and testing DataFrames.
-# (We then combine these to form the full dataset for feature engineering.)
-print("Preprocessing data...")
-train_df, test_df = preprocess_data(raw_df, config.features_to_use, config.target_feature)
-print("Data preprocessing completed.")
-full_df = pd.concat([train_df, test_df], ignore_index=True)
-print("Combined full dataset shape for feature engineering:", full_df.shape)
-
-# (Optional) You might initially create dataloaders here, but we will re-create them
-# after feature engineering.
-# train_dataloader, test_dataloader = create_dataloaders(train_df, test_df, batch_size, seq_len, pred_len)
-
-# ---------------------------
-# III. Feature Engineering (VMD-MIC+FE)
-# ---------------------------
-# Import feature engineering functions (which internally uses vmd_mic.py)
 from features.feature_engineering import (
-    vmd_feature_extraction,
-    fuzzy_entropy_feature_extraction,
-    composite_feature_creation,
-    correlation_based_feature_selection,
-    integrate_features,
+    variational_mode_decomposition,
     determine_optimal_k,
-    variational_mode_decomposition
-)
-print("Feature engineering functions imported.")
-
-# Setup cache directory and file for feature extraction
-cache_dir = os.path.join(config.output_dir, 'cache')
-if not os.path.exists(cache_dir):
-    os.makedirs(cache_dir)
-cache_file = os.path.join(cache_dir, 'feature_cache.pkl')
-
-def load_or_compute(cache_path, compute_func):
-    """
-    Checks if the cache file exists. If so, load and return the cached result.
-    Otherwise, compute the result using compute_func(), store it in the cache, then return it.
-    """
-    if os.path.exists(cache_path):
-        print(f"Loading cache from {cache_path}")
-        with open(cache_path, "rb") as f:
-            result = pickle.load(f)
-        return result
-    else:
-        result = compute_func()
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f)
-        print(f"Cached results saved to {cache_path}")
-        return result
-
-def compute_imfs():
-    results = []
-    for feature in config.features_to_decompose:
-        print(f"Processing {feature} for training...")
-        train_signal = train_df[feature].values.astype(np.float32)
-        optimal_k = determine_optimal_k(train_signal, config.k_range, config.vmd_params_dict)
-        imfs_train = variational_mode_decomposition(
-            train_signal, 
-            K=optimal_k, 
-            **{k: v for k, v in config.vmd_params_dict.items() if k not in ['K', 'chunk_size']}
-        )
-        results.append((feature, optimal_k, imfs_train.astype(np.float32)))
-    
-    optimal_k_dict = {feature: k for feature, k, _ in results}
-    imfs_dict_train = {feature: imfs for feature, _, imfs in results}
-    
-    print("Processing testing data for IMFs...")
-    imfs_dict_test = {}
-    for feature in config.features_to_decompose:
-        print(f"Processing {feature} (test)...")
-        test_signal = test_df[feature].values.astype(np.float32)
-        optimal_k = optimal_k_dict[feature]
-        imfs_test = variational_mode_decomposition(
-            test_signal, 
-            K=optimal_k, 
-            **{k: v for k, v in config.vmd_params_dict.items() if k not in ['K', 'chunk_size']}
-        )
-        imfs_dict_test[feature] = imfs_test.astype(np.float32)
-        del test_signal
-        gc.collect()
-    
-    return optimal_k_dict, imfs_dict_train, imfs_dict_test
-
-imfs_cache_path = os.path.join(cache_dir, 'imfs_cache.pkl')
-def compute_imfs_full():
-    results = []
-    for feature in config.features_to_decompose:
-        print(f"Processing {feature} for VMD on full dataset...")
-        signal = full_df[feature].values.astype(np.float32)
-        optimal_k = determine_optimal_k(signal, config.k_range, config.vmd_params_dict)
-        imfs = variational_mode_decomposition(
-            signal, 
-            K=optimal_k, 
-            **{k: v for k, v in config.vmd_params_dict.items() if k not in ['K', 'chunk_size']}
-        )
-        results.append((feature, optimal_k, imfs.astype(np.float32)))
-    optimal_k_dict = {feature: k for feature, k, _ in results}
-    imfs_dict = {feature: imfs for feature, _, imfs in results}
-    return optimal_k_dict, imfs_dict
-
-imf_result = load_or_compute(imfs_cache_path, compute_imfs_full)
-if isinstance(imf_result, tuple) and len(imf_result) > 2:
-    imf_result = imf_result[:2]
-optimal_k_dict, imfs_dict = imf_result
-
-# After processing imfs_dict_train and imfs_dict_test, add:
-from features.feature_engineering import (
     fuzzy_entropy_feature_extraction,
     composite_feature_creation,
     correlation_based_feature_selection,
     integrate_features
 )
 
-# Generate feature matrices
-print("Creating final feature matrices...")
+def process_single_csv(file_path):
+    print(f"Processing CSV file: {file_path}")
+    df = pd.read_csv(file_path)
+    optimal_k_dict = {}
+    imfs_dict = {}
+    for feature in config.features_to_decompose:
+        if feature in df.columns:
+            print(f"Processing VMD for feature: {feature}")
+            signal = df[feature].values.astype(np.float32)
+            optimal_k = determine_optimal_k(signal, config.k_range, config.vmd_params_dict)
+            optimal_k_dict[feature] = optimal_k
+            imfs = variational_mode_decomposition(
+                signal, 
+                K=optimal_k, 
+                **{k: v for k, v in config.vmd_params_dict.items() if k not in ['K', 'chunk_size']}
+            )
+            imfs_dict[feature] = imfs.astype(np.float32)
+        else:
+            print(f"Warning: {feature} not found in {file_path}")
+    fe_values, processed_imfs = fuzzy_entropy_feature_extraction(imfs_dict)
+    composite_features = composite_feature_creation(fe_values, processed_imfs, config.fe_thresholds)
+    selected_features = correlation_based_feature_selection(df, config.target_feature)
+    final_feature_matrix = integrate_features(df, composite_features, selected_features)
+    return final_feature_matrix, df[config.target_feature].values
 
-# Get both return values from fuzzy entropy extraction
-def compute_fuzzy_entropy():
-    return fuzzy_entropy_feature_extraction(imfs_dict)
+feature_matrices = []
+target_arrays = []
+for csv_file in csv_files:
+    features, target = process_single_csv(csv_file)
+    feature_matrices.append(features)
+    target_arrays.append(target)
 
-fe_cache_path = os.path.join(cache_dir, 'fe_cache.pkl')
-fe_values, processed_imfs = load_or_compute(fe_cache_path, compute_fuzzy_entropy)
+full_features = pd.concat(feature_matrices, ignore_index=True)
+full_target = np.concatenate(target_arrays)
+print("Combined feature matrix shape for training:", full_features.shape)
 
-def compute_composite_features():
-    return composite_feature_creation(fe_values, processed_imfs, config.fe_thresholds)
-
-composite_cache = os.path.join(cache_dir, 'composite_cache.pkl')
-composite_features = load_or_compute(composite_cache, compute_composite_features)
-
-# Perform MIC-based correlation feature selection on the full dataset
-selected_features = correlation_based_feature_selection(full_df, config.target_feature)
-
-# Integrate features on the full dataset
-final_features_cache = os.path.join(cache_dir, 'final_features_full.pkl')
-final_feature_matrix = load_or_compute(final_features_cache, lambda: integrate_features(full_df, composite_features, selected_features))
-print("Final integrated feature matrix shape:", final_feature_matrix.shape)
-
-# Split the final integrated features and target into train and test sets (90/10 split)
-split_idx = int(len(final_feature_matrix) * 0.9)
-train_feature_matrix = final_feature_matrix.iloc[:split_idx]
-test_feature_matrix = final_feature_matrix.iloc[split_idx:]
-
-full_target = full_df[config.target_feature].values
-y_train = full_target[:split_idx]
-y_test = full_target[split_idx:]
-
-# Standardize the feature matrices
-feature_scaler = StandardScaler()
-train_feature_matrix = pd.DataFrame(
-    feature_scaler.fit_transform(train_feature_matrix),
-    columns=train_feature_matrix.columns)
-test_feature_matrix = pd.DataFrame(
-    feature_scaler.transform(test_feature_matrix),
-    columns=test_feature_matrix.columns)
-
-# Standardize the targets as well (optional, but recommended for stability)
-target_scaler = StandardScaler()
-y_train = target_scaler.fit_transform(y_train.reshape(-1, 1)).flatten()
-y_test = target_scaler.transform(y_test.reshape(-1, 1)).flatten()
-
-# Add this helper function to create sliding window pairs (features and labels)
-def create_window_pairs(data, target, seq_len, pred_len):
-    """
-    Converts a 2D array (time steps, features) and a target array into sliding window pairs.
-    The output shapes will be:
-        features: (num_windows, seq_len, num_features)
-        targets: (num_windows, pred_len)
-    where num_windows = len(data) - seq_len - pred_len + 1.
-    """
-    X, Y = [], []
-    num_windows = len(data) - seq_len - pred_len + 1
-    for i in range(num_windows):
-        X.append(data[i : i + seq_len])
-        Y.append(target[i + seq_len : i + seq_len + pred_len])
-    return np.array(X), np.array(Y)
-
-# --------- Create DataLoaders from the Final Feature Matrices ---------
-from torch.utils.data import TensorDataset, DataLoader
-print("Imported TensorDataset and DataLoader from torch.utils.data.")
-
-# Convert feature matrices to numpy if they are pandas DataFrames
-print("Converting feature matrices to numpy arrays if necessary.")
-if isinstance(train_feature_matrix, pd.DataFrame):
-    train_feature_matrix = train_feature_matrix.values
-if isinstance(test_feature_matrix, pd.DataFrame):
-    test_feature_matrix = test_feature_matrix.values
-
-# Create sliding window pairs (features and corresponding targets) for training and testing.
-train_features, train_labels = create_window_pairs(train_feature_matrix, y_train, config.seq_len, config.pred_len)
-test_features, test_labels = create_window_pairs(test_feature_matrix, y_test, config.seq_len, config.pred_len)
-
-print(f"Created sliding window pairs: Train features shape {train_features.shape}, Train labels shape {train_labels.shape}; Test features shape {test_features.shape}, Test labels shape {test_labels.shape}")
-
-# Convert to tensors
-train_features = torch.tensor(train_features, dtype=torch.float32)
-# If output_dim is 1, add an extra dimension for targets.
-train_labels = torch.tensor(train_labels, dtype=torch.float32).unsqueeze(-1)
-test_features = torch.tensor(test_features, dtype=torch.float32)
-test_labels = torch.tensor(test_labels, dtype=torch.float32).unsqueeze(-1)
-
-# Create PyTorch datasets and dataloaders
-print("Creating PyTorch datasets and dataloaders.")
-train_dataset = TensorDataset(train_features, train_labels)
-test_dataset = TensorDataset(test_features, test_labels)
-
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-print("PyTorch datasets and dataloaders created.")
+# Feature engineering already applied per CSV file. Using the processed features directly.
 
 # ---------------------------
 # IV. Model Initialization
