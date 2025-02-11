@@ -401,6 +401,37 @@ with open(cache_file, 'wb') as f:
     pickle.dump((optimal_k_dict, imfs_dict), f)
 print("Feature extraction data cached.")
 
+# ---------------------------
+# IX. Run Inference (Example)
+# ---------------------------
+print("Running inference example...")
+import subprocess
+
+# Construct the command to run inference.py
+#  We'll use the test data for this example, but you could use any CSV.
+#  Adjust paths as necessary.
+
+# Find a test file to use for inference
+test_csv_files = glob.glob(os.path.join('data/processed', '*.csv'))
+if not test_csv_files:
+    print("No CSV files found in processed folder for inference.")
+else:
+    inference_data_path = test_csv_files[0]  # Use the first CSV file found
+    inference_command = [
+        "python",
+        "inference.py",
+        "--data_path", inference_data_path,
+        "--model_path", os.path.join(config.output_dir, "trained_model_weights.pth"),
+        "--scaler_path", os.path.join(config.output_dir, "feature_scaler.pkl"),
+        "--output_path", os.path.join(config.output_dir, "example_predictions.csv")
+    ]
+
+    try:
+        subprocess.run(inference_command, check=True)
+        print("Inference completed.  Example predictions saved.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error running inference: {e}")
+
 if __name__ == "__main__":
     # M1/MPS specific initialization
     if device.type == 'mps': # Only relevant for MPS

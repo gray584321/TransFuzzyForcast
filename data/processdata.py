@@ -40,6 +40,7 @@ import os
 import logging
 import multiprocessing as mp
 from functools import partial
+import random
 
 # Initialize logging
 logging.getLogger(__name__)
@@ -411,6 +412,8 @@ def main():
                         help="Resample data to get ticker_skip minute intervals.")
     parser.add_argument("--num_processes", type=int, default=10,
                         help="Number of parallel processes to use.")
+    parser.add_argument("--num_tickers", type=int, default=50,
+                        help="Number of tickers to process (random subset). 0 means process all tickers.")
     args = parser.parse_args()
     
     ticker_skip = args.ticker_skip
@@ -436,6 +439,10 @@ def main():
     # Get list of CSV files
     csv_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.csv')]
     
+    # If num_tickers is non-zero, randomly select that many files
+    if args.num_tickers > 0:
+        csv_files = random.sample(csv_files, min(args.num_tickers, len(csv_files)))
+
     if not csv_files:
         print("No CSV files found in input folder.")
         return

@@ -79,13 +79,13 @@ amsgrad = False
 gc_momentum = 0.5
 beta_initial = 0.5
 c = 1.0
-epochs = 250
-early_stopping_patience = 50
+epochs = 100
+early_stopping_patience = 10
 output_dir = "results/"
 
 # Add these configuration parameters to your config.py
 # Example configuration parameters - adjust values according to your needs
-batch_size = 64
+batch_size = 128
 learning_rate = 0.00001
 seq_len = 256  # Input sequence length
 pred_len = 32 # Prediction length

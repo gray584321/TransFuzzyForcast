@@ -2,24 +2,52 @@
 """
 clean_cache.py
 
-Deletes the feature extraction cache so that all data will be reprocessed.
+Removes cached pickle files to force recomputation of features and model training.
 """
 
 import os
-import shutil
-import config  # Ensure your config module defines config.output_dir
+import glob
+import argparse
 
-def clean_cache():
-    cache_dir = os.path.join(config.output_dir, 'cache')
-    if os.path.exists(cache_dir):
-        confirm = input(f"Are you sure you want to delete the cache directory '{cache_dir}'? (y/n): ")
-        if confirm.lower() == 'y':
-            shutil.rmtree(cache_dir)
-            print("Cache directory has been deleted.")
-        else:
-            print("Operation cancelled. Cache directory was not deleted.")
+def clean_cache(directory):
+    """
+    Removes specified cache files from the given directory.
+    """
+    print(f"Cleaning cache in directory: {directory}")
+
+    # Define the patterns for cache files to be removed.  Crucially,
+    # we now include *both* cache files.
+    cache_patterns = [
+        "processed_features.pkl",
+        "feature_extraction_cache.pkl",
+        "feature_scaler.pkl",
+        "best_model.pth",
+        "trained_model_weights.pth"
+    ]
+
+    files_removed = 0
+    for pattern in cache_patterns:
+        # Use glob to find all files matching the pattern
+        files_to_remove = glob.glob(os.path.join(directory, pattern))
+
+        for file_path in files_to_remove:
+            try:
+                os.remove(file_path)
+                print(f"Removed: {file_path}")
+                files_removed += 1
+            except OSError as e:
+                print(f"Error removing {file_path}: {e}")
+
+    if files_removed == 0:
+        print("No cache files found to remove.")
     else:
-        print("Cache directory does not exist.")
+        print(f"Total cache files removed: {files_removed}")
 
 if __name__ == "__main__":
-    clean_cache() 
+    parser = argparse.ArgumentParser(description="Clean cache files.")
+    parser.add_argument('--dir', type=str, default='results/',
+                        help='Directory to clean cache files from. Defaults to "results/".')
+    args = parser.parse_args()
+
+    clean_cache(args.dir)
+    print("Cache cleaning completed.") 

@@ -14,6 +14,7 @@ import os
 import logging
 import math
 from tqdm import tqdm
+from torch.optim.lr_scheduler import OneCycleLR
 
 # Initialize logging
 logging.getLogger(__name__)
@@ -89,48 +90,146 @@ def validate_epoch(model, dataloader, loss_function, device):
     r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0.0
     return avg_loss, r2.item()
 
-def train_model(model, train_dataloader, val_dataloader, loss_function, optimizer, epochs, device, early_stopping_patience, gradient_clip_value=1.0):
+def train_model(model, train_dataloader, val_dataloader, loss_function, optimizer, epochs, device, early_stopping_patience):
+    """
+    Trains the model using:
+      - Pre-allocation of memory via a dummy pass.
+      - OneCycleLR scheduler with warmup.
+      - Gradient clipping.
+      - Optionally, a robust loss such as SmoothL1Loss (Huber loss) if desired.
+    """
+    # -------------------------------
+    # Preallocate memory for max input sizes
+    # -------------------------------
+    print("Preallocating memory using a dummy forward/backward pass...")
+    # We get one batch, which should be close to the maximum expected size.
+    for batch in train_dataloader:
+        dummy_inputs, dummy_targets = batch
+        dummy_inputs = dummy_inputs.to(device)
+        dummy_targets = dummy_targets.to(device)
+        dummy_output = model(dummy_inputs)
+        # If the model output has a trailing singleton dimension, squeeze it.
+        if dummy_output.dim() == 3 and dummy_output.size(-1) == 1:
+            dummy_output = dummy_output.squeeze(-1)
+        # Similarly, if dummy_targets has an extra dimension, squeeze it.
+        if dummy_targets.dim() == 3 and dummy_targets.size(-1) == 1:
+            dummy_targets = dummy_targets.squeeze(-1)
+        expected_pred_len = dummy_output.size(1)
+        if dummy_targets.size(1) != expected_pred_len:
+            dummy_targets = dummy_targets[:, :expected_pred_len]
+        dummy_loss = loss_function(dummy_output, dummy_targets)
+        # Backward pass to preallocate internal buffers for backward
+        dummy_loss.backward()
+        optimizer.zero_grad()
+        break
+    print("Memory preallocation done.")
+    
+    # -------------------------------
+    # Setup OneCycleLR Scheduler with warmup
+    # -------------------------------
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=optimizer.param_groups[0]['lr'],  # Starting max learning rate
+        steps_per_epoch=len(train_dataloader),
+        epochs=epochs,
+        anneal_strategy='linear',
+        pct_start=0.1  # First 10% as warmup
+    )
+    
     best_val_loss = float('inf')
-    epochs_no_improve = 0
-    training_history = {'train_loss': [], 'val_loss': [], 'val_r2': []}
-    best_model_path = os.path.join("best_model.pth")
+    best_model_state = None
+    no_improve_count = 0
+    history = {'train_loss': [], 'val_loss': []}
     
-    # Create a ReduceLROnPlateau scheduler which reduces LR by factor 0.5 if the validation loss does not improve for 2 epochs
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
-    
-    for epoch in range(1, epochs + 1):
-        print(f"--- Epoch {epoch} ---")
-        train_loss = train_epoch(model, train_dataloader, loss_function, optimizer, device, gradient_clip_value, epoch)
-        val_loss, r2 = validate_epoch(model, val_dataloader, loss_function, device)
-        # If validation loss is NaN, set it to infinity for comparison purposes
-        if math.isnan(val_loss):
-            print(f"Epoch {epoch}: Validation loss is NaN. Setting to infinity for comparison.")
-            val_loss = float('inf')
-        training_history['train_loss'].append(train_loss)
-        training_history['val_loss'].append(val_loss)
-        training_history.setdefault('val_r2', []).append(r2)
-        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Validation R2 = {r2:.4f}")
+    # -------------------------------
+    # Training Loop
+    # -------------------------------
+    for epoch in range(epochs):
+        model.train()
+        train_loss_accum = 0.0
+        num_batches = 0
+        total_grad_norm = 0.0
         
-        # Step the scheduler with the current validation loss
-        scheduler.step(val_loss)
-        # Print current learning rate for monitoring
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Current Learning Rate: {current_lr:.6f}")
+        for (inputs, targets) in tqdm(train_dataloader, desc=f"Epoch {epoch+1} progress", unit="batch"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            # Squeeze the model output if necessary.
+            if outputs.dim() == 3 and outputs.size(-1) == 1:
+                outputs = outputs.squeeze(-1)
+            # Similarly, squeeze targets if they have an extra dimension.
+            if targets.dim() == 3 and targets.size(-1) == 1:
+                targets = targets.squeeze(-1)
+            # If the target sequence length does not match the output, truncate targets.
+            if targets.size(1) != outputs.size(1):
+                targets = targets[:, :outputs.size(1)]
+            loss = loss_function(outputs, targets)
+            loss.backward()
+            
+            # Gradient Clipping: capture gradient norm
+            grad_norm = clip_grad_norm_(model.parameters(), max_norm=1.0)
+            total_grad_norm += grad_norm
+            
+            optimizer.step()
+            scheduler.step()  # Updates learning rate according to OneCycle policy
+            
+            train_loss_accum += loss.item()
+            num_batches += 1
         
-        # Always save the model after the first epoch, then update only if loss improves
-        if epoch == 1 or val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), best_model_path)
-            print("Best model updated.")
-        else:
-            epochs_no_improve += 1
-            print(f"No improvement for {epochs_no_improve} epoch(s).")
+        avg_train_loss = train_loss_accum / num_batches
+        history['train_loss'].append(avg_train_loss)
+        avg_grad_norm = total_grad_norm / num_batches if num_batches > 0 else 0.0
         
-        if epochs_no_improve >= early_stopping_patience:
-            print("Early stopping triggered.")
-            break
+        # Validation phase
+        model.eval()
+        val_loss_accum = 0.0
+        val_batches = 0
+        all_val_preds = []
+        all_val_targets = []
+        with torch.no_grad():
+            for (inputs, targets) in val_dataloader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                # Squeeze output and targets if they have an extra dimension.
+                if outputs.dim() == 3 and outputs.size(-1) == 1:
+                    outputs = outputs.squeeze(-1)
+                if targets.dim() == 3 and targets.size(-1) == 1:
+                    targets = targets.squeeze(-1)
+                # Truncate targets if necessary.
+                if targets.size(1) != outputs.size(1):
+                    targets = targets[:, :outputs.size(1)]
+                loss = loss_function(outputs, targets)
+                val_loss_accum += loss.item()
+                val_batches += 1
+                all_val_preds.append(outputs.detach().cpu())
+                all_val_targets.append(targets.detach().cpu())
+        avg_val_loss = val_loss_accum / val_batches
+        history['val_loss'].append(avg_val_loss)
+        
+        # Compute additional validation metrics: R² and RMSE
+        all_val_preds = torch.cat(all_val_preds, dim=0)
+        all_val_targets = torch.cat(all_val_targets, dim=0)
+        mse_val = torch.mean((all_val_preds - all_val_targets) ** 2).item()
+        rmse_val = mse_val ** 0.5
+        ss_res = torch.sum((all_val_targets - all_val_preds) ** 2)
+        ss_tot = torch.sum((all_val_targets - torch.mean(all_val_targets)) ** 2)
+        r2_val = 1 - (ss_res / ss_tot).item() if ss_tot != 0 else 0.0
 
-    # Load the best model weights
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
-    return model, training_history 
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val R²: {r2_val:.4f} | Val RMSE: {rmse_val:.4f} | Avg Grad Norm: {avg_grad_norm:.4f}")
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict()
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+            if no_improve_count >= early_stopping_patience:
+                print("Early stopping triggered!")
+                break
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    return model, history 
