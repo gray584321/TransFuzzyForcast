@@ -1,0 +1,11 @@
+python-dotenv
+requests
+torch
+tqdm
+psutil
+numpy 
+numba
+scikit-learn
+EntropyHub
+sktime
+modin[ray]

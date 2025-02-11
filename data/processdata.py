@@ -38,6 +38,8 @@ import numpy as np
 import argparse
 import os
 import logging
+import multiprocessing as mp
+from functools import partial
 
 # Initialize logging
 logging.getLogger(__name__)
@@ -71,7 +73,8 @@ def compute_features(df):
 
     # 3. Return_Lag1 to Return_Lag6
     for lag in range(1, 7):
-        df[f"Return_Lag{lag}"] = df["Close_Price"].pct_change(periods=lag)
+        # Explicitly set fill_method to None to avoid use of the deprecated default value.
+        df[f"Return_Lag{lag}"] = df["Close_Price"].pct_change(periods=lag, fill_method=None)
     logging.debug("Computed 'Return_Lag1' to 'Return_Lag6'.")
 
     # 4. Moving Averages and rolling correlation
@@ -157,6 +160,62 @@ def compute_features(df):
     df["Processed_Close_Price"] = (df["Close_Log_Diff"] - mean_diff) / std_diff
     logging.debug("Computed 'Processed_Close_Price'.")
 
+    # 15. MACD and related indicators (using 12 and 26-period EMAs with a 9-period signal)
+    ema12 = df["Close_Price"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close_Price"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
+    logging.debug("Computed 'MACD', 'MACD_Signal', and 'MACD_Hist'.")
+
+    # 16. Bollinger Bands (20-period SMA with 2 standard deviations)
+    sma20 = df["Close_Price"].rolling(window=20).mean()
+    std20 = df["Close_Price"].rolling(window=20).std()
+    df["Bollinger_Upper"] = sma20 + 2 * std20
+    df["Bollinger_Middle"] = sma20
+    df["Bollinger_Lower"] = sma20 - 2 * std20
+    logging.debug("Computed 'Bollinger_Upper', 'Bollinger_Middle', and 'Bollinger_Lower'.")
+
+    # 17. On-Balance Volume (OBV)
+    df["OBV"] = (np.sign(df["Close_Price"].diff()) * df["Stock_Volume"]).fillna(0).cumsum()
+    logging.debug("Computed 'OBV' (On Balance Volume).")
+
+    # 18. Stochastic Oscillator (%K and %D with a 14-period window and 3-period SMA for %D)
+    period = 14
+    df["Stochastic_K"] = ((df["Close_Price"] - df["Low_Price"].rolling(window=period).min()) / 
+                          (df["High_Price"].rolling(window=period).max() - df["Low_Price"].rolling(window=period).min())) * 100
+    df["Stochastic_D"] = df["Stochastic_K"].rolling(window=3).mean()
+    logging.debug("Computed 'Stochastic_K' and 'Stochastic_D'.")
+
+    # 19. Average Directional Movement Index (ADX)
+    df["prevHigh"] = df["High_Price"].shift(1)
+    df["prevLow"] = df["Low_Price"].shift(1)
+    df["prevClose"] = df["Close_Price"].shift(1)
+
+    # Calculate directional movements
+    df["plus_dm"] = np.where((df["High_Price"] - df["prevHigh"]) > (df["prevLow"] - df["Low_Price"]),
+                              np.maximum(df["High_Price"] - df["prevHigh"], 0), 0)
+    df["minus_dm"] = np.where((df["prevLow"] - df["Low_Price"]) > (df["High_Price"] - df["prevHigh"]),
+                               np.maximum(df["prevLow"] - df["Low_Price"], 0), 0)
+    # True Range calculation
+    df["tr"] = np.maximum(
+        np.maximum(df["High_Price"] - df["Low_Price"], abs(df["High_Price"] - df["prevClose"])),
+        abs(df["Low_Price"] - df["prevClose"])
+    )
+    period_adx = 14
+    df["tr_sum"] = df["tr"].rolling(window=period_adx).sum()
+    df["plus_dm_sum"] = df["plus_dm"].rolling(window=period_adx).sum()
+    df["minus_dm_sum"] = df["minus_dm"].rolling(window=period_adx).sum()
+    df["plus_di"] = 100 * (df["plus_dm_sum"] / df["tr_sum"])
+    df["minus_di"] = 100 * (df["minus_dm_sum"] / df["tr_sum"])
+    df["dx"] = 100 * (abs(df["plus_di"] - df["minus_di"]) / (df["plus_di"] + df["minus_di"]))
+    df["ADX"] = df["dx"].rolling(window=period_adx).mean()
+    logging.debug("Computed 'ADX' (Average Directional Movement Index).")
+
+    # Drop intermediate columns for ADX
+    df.drop(columns=["prevHigh", "prevLow", "prevClose", "plus_dm", "minus_dm",
+                     "tr", "tr_sum", "plus_dm_sum", "minus_dm_sum", "plus_di", "minus_di", "dx"], inplace=True)
+
     # Drop intermediate columns that are not part of the final output
     df.drop(columns=["MA5", "MA30", "Close_Log", "Close_Log_Diff"], inplace=True)
     logging.debug("Dropped intermediate columns.")
@@ -189,41 +248,15 @@ def validate_file(df, filename):
     print(f"File {filename} structure validated successfully.")
     return True
 
-def main():
-    print("Starting main function in processdata.py.")
-    # Import config at runtime to access the VALIDATED_FILES
-    import sys
-    sys.path.append('data')
-    import config
-
-    # Initialize VALIDATED_FILES if it doesn't exist
-    if not hasattr(config, 'VALIDATED_FILES'):
-        config.VALIDATED_FILES = {}
-
-    input_folder = "data/raw"
-    output_folder = "data/processed"
-    merged_output_folder = "data/ready_for_train"  # New folder for merged data
-
-    # Create directories if they don't exist
-    os.makedirs(output_folder, exist_ok=True)
-    os.makedirs(merged_output_folder, exist_ok=True)
-    print(f"Output directories created: {output_folder}, {merged_output_folder}")
-
-    processed_files = []  # Track processed output file paths
-
-    for filename in os.listdir(input_folder):
-        if not filename.lower().endswith('.csv'):
-            logging.debug(f"Skipping non-CSV file: {filename}")
-            continue
-
+def process_single_file(filename, input_folder, output_folder, ticker_skip, validated_files):
+    """Process a single CSV file with all the feature computations."""
+    try:
         input_filepath = os.path.join(input_folder, filename)
         print(f"Processing file: {input_filepath}")
-        print(f"Processing {input_filepath} ...")
 
         # Read CSV
         df = pd.read_csv(input_filepath)
-        logging.debug(f"CSV file read into DataFrame. Shape: {df.shape}")
-
+        
         # Rename columns from the input CSV to the standard column names
         rename_dict = {
             "datetime": "DateTime",
@@ -234,19 +267,46 @@ def main():
             "volume": "Stock_Volume"
         }
         df.rename(columns=rename_dict, inplace=True)
-        logging.debug(f"Columns renamed using dictionary: {rename_dict}")
+
+        # Resample to ticker_skip-minute intervals if ticker_skip > 1.
+        if ticker_skip > 1:
+            print(f"Resampling data to {ticker_skip}-minute intervals.")
+            # Ensure DateTime is datetime and set it as index for resampling.
+            df["DateTime"] = pd.to_datetime(df["DateTime"])
+            df.set_index("DateTime", inplace=True)
+            # Use "min" as the alias to avoid deprecation warnings.
+            resample_freq = f"{ticker_skip}min"
+            # Define aggregation rules for OHLCV data.
+            agg_dict = {
+                "Open_Price": "first",
+                "High_Price": "max",
+                "Low_Price": "min",
+                "Close_Price": "last",
+                "Stock_Volume": "sum"
+            }
+            if "RMB_Volume" in df.columns:
+                agg_dict["RMB_Volume"] = "sum"
+            if "vwap" in df.columns and "Stock_Volume" in df.columns:
+                agg_dict["vwap"] = lambda x: (x * df.loc[x.index, "Stock_Volume"]).sum() / df.loc[x.index, "Stock_Volume"].sum() if df.loc[x.index, "Stock_Volume"].sum() != 0 else np.nan
+            if "num_trades" in df.columns:
+                agg_dict["num_trades"] = "sum"
+            if "Ticker" in df.columns:
+                agg_dict["Ticker"] = "first"
+
+            # Use groupby with pd.Grouper instead of resample().agg() to avoid the attribute error.
+            df = df.groupby(pd.Grouper(freq=resample_freq)).agg(agg_dict).reset_index()
+            print(f"Resampled data has {len(df)} rows.")
 
         # Check if file needs validation
-        if filename not in config.VALIDATED_FILES:
-            print(f"Validating {filename} for the first time...")
+        if filename not in validated_files:
             print(f"Validating {filename} for the first time...")
             if not validate_file(df, filename):
                 logging.warning(f"Validation failed for {filename}. Skipping file.")
                 print(f"Skipping {filename} due to validation failure")
-                continue
+                return None
 
             # Mark file as validated and save to config
-            config.VALIDATED_FILES[filename] = True
+            validated_files[filename] = True
             print(f"File {filename} validated successfully.")
 
             # Save the updated VALIDATED_FILES to config.py
@@ -254,7 +314,6 @@ def main():
                 f.write(f"\nVALIDATED_FILES['{filename}'] = True  # Validated on {pd.Timestamp.now()}\n")
             print(f"Updated VALIDATED_FILES in config.py for {filename}.")
         else:
-            print(f"Skipping validation for previously validated file: {filename}")
             print(f"Skipping validation for previously validated file: {filename}")
 
         # Continue with the rest of the processing
@@ -311,6 +370,16 @@ def main():
             "ATR_10",
             "CCI",
             "DEMA",
+            "MACD",
+            "MACD_Signal",
+            "MACD_Hist",
+            "Bollinger_Upper",
+            "Bollinger_Middle",
+            "Bollinger_Lower",
+            "OBV",
+            "Stochastic_K",
+            "Stochastic_D",
+            "ADX",
             "Year",
             "Month",
             "Day",
@@ -328,27 +397,79 @@ def main():
         # Save processed file and track path
         output_filepath = os.path.join(output_folder, filename)
         df_processed.to_csv(output_filepath, index=False)
-        processed_files.append(output_filepath)  # Add to processed files list
         print(f"Processed data saved to: {output_filepath}")
-        print(f"Processed data saved to {output_filepath}")
+        return output_filepath
+        
+    except Exception as e:
+        print(f"Error processing {filename}: {str(e)}")
+        return None
 
-    # Merge all processed files into one CSV
-    if processed_files:
-        print("Merging all processed files.")
-        merged_df = pd.concat(
-            (pd.read_csv(f) for f in processed_files),
-            ignore_index=True
-        )
-        # Save to ready_for_train folder instead of processed
-        merged_path = os.path.join(merged_output_folder, "merged_stock_data.csv")
-        merged_df.to_csv(merged_path, index=False)
-        print(f"Successfully merged all files into: {merged_path}")
-        print(f"\nSuccessfully merged all files into {merged_path}")
-    else:
-        logging.warning("No files processed - nothing to merge.")
-        print("\nNo files processed - nothing to merge")
+def main():
+    print("Starting main function in processdata.py.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ticker_skip", type=int, default=5,
+                        help="Resample data to get ticker_skip minute intervals.")
+    parser.add_argument("--num_processes", type=int, default=10,
+                        help="Number of parallel processes to use.")
+    args = parser.parse_args()
+    
+    ticker_skip = args.ticker_skip
+    num_processes = args.num_processes
+    print(f"Ticker skip parameter is set to: {ticker_skip}")
+    print(f"Number of parallel processes: {num_processes}")
+
+    # Import config at runtime to access the VALIDATED_FILES
+    import sys
+    sys.path.append('data')
+    import config
+
+    # Initialize VALIDATED_FILES if it doesn't exist
+    validated_files = getattr(config, 'VALIDATED_FILES', {})
+
+    input_folder = "data/raw"
+    output_folder = "data/processed"
+
+    # Create directories if they don't exist
+    os.makedirs(output_folder, exist_ok=True)
+    print(f"Output directory created: {output_folder}")
+
+    # Get list of CSV files
+    csv_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.csv')]
+    
+    if not csv_files:
+        print("No CSV files found in input folder.")
+        return
+
+    # Create a pool of workers
+    pool = mp.Pool(processes=min(num_processes, len(csv_files)))
+    
+    # Create a partial function with fixed arguments
+    process_file_partial = partial(
+        process_single_file,
+        input_folder=input_folder,
+        output_folder=output_folder,
+        ticker_skip=ticker_skip,
+        validated_files=validated_files  # Pass the validated_files dictionary
+    )
+
+    # Process files in parallel
+    try:
+        processed_files = pool.map(process_file_partial, csv_files)
+        
+        # Clean up None values from failed processes
+        processed_files = [f for f in processed_files if f is not None]
+        
+        print(f"Successfully processed {len(processed_files)} files:")
+        for filepath in processed_files:
+            print(f"- {filepath}")
+            
+    finally:
+        pool.close()
+        pool.join()
 
     print("Main function in processdata.py completed.")
 
 if __name__ == "__main__":
+    # Set multiprocessing start method
+    mp.set_start_method('spawn', force=True)
     main()

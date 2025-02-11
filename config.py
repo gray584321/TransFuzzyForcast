@@ -62,7 +62,7 @@ fuzzy_m = 2
 fuzzy_r = 0.2
 fuzzy_n = 2
 fe_thresholds = {'threshold1': 0.5}
-mic_threshold = 0.6
+mic_threshold = 0.5
 input_dim = 10
 feature_dim = 64
 output_dim = 1
@@ -85,14 +85,14 @@ output_dir = "results/"
 
 # Add these configuration parameters to your config.py
 # Example configuration parameters - adjust values according to your needs
-batch_size = 1024
+batch_size = 64
 learning_rate = 0.00001
-seq_len = 12     # Input sequence length
-pred_len = 6     # Prediction length
+seq_len = 256  # Input sequence length
+pred_len = 32 # Prediction length
 device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
 # Reduce default K range
-k_range = range(5, 9)  # Instead of larger ranges like 3-10
+k_range = range(5, 10)  # Instead of larger ranges like 3-10
 
 # Set default float precision
 DEFAULT_DTYPE = np.float32 

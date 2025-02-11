@@ -33,7 +33,10 @@ batch_size = config.batch_size
 learning_rate = config.learning_rate
 seq_len = config.seq_len
 pred_len = config.pred_len
-device = config.device
+# --- Device-Agnostic Setup ---
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
 print("Hyperparameters and settings loaded from config.")
 
 # ---------------------------
@@ -43,6 +46,8 @@ print("Checking for cached processed features...")
 if not os.path.exists(config.output_dir):
     os.makedirs(config.output_dir)
 features_cache_path = os.path.join(config.output_dir, "processed_features.pkl")
+# Define cache_file
+cache_file = os.path.join(config.output_dir, "feature_extraction_cache.pkl")
 
 if os.path.exists(features_cache_path):
     print(f"Loading cached processed features from {features_cache_path}")
@@ -119,7 +124,7 @@ else:
         
         print("Integrating features...")
         final_feature_matrix = integrate_features(df, composite_features, selected_features)
-        return final_feature_matrix, df[config.target_feature].values, selected_features, optimal_k_dict
+        return final_feature_matrix, df[config.target_feature].values.astype(np.float32), selected_features, optimal_k_dict
 
     # Process first file to get selected features and optimal k values
     print("\nProcessing first file to determine optimal k values and selected features...")
@@ -195,16 +200,16 @@ train_dataloader = DataLoader(
     train_dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=0,  # Set to 0 for Apple Silicon
-    pin_memory=True if torch.backends.mps.is_available() else False
+    num_workers=0,  # Set to 0 for Apple Silicon and non-CUDA
+    pin_memory=True if device.type == 'cuda' else False  # Only pin memory for CUDA
 )
 
 test_dataloader = DataLoader(
     test_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=0,  # Set to 0 for Apple Silicon
-    pin_memory=True if torch.backends.mps.is_available() else False
+    num_workers=0,  # Set to 0 for Apple Silicon and non-CUDA
+    pin_memory=True if device.type == 'cuda' else False  # Only pin memory for CUDA
 )
 
 print(f"Created dataloaders - Train batches: {len(train_dataloader)}, Test batches: {len(test_dataloader)}")
@@ -240,7 +245,7 @@ model = EnhancedLFTSformer(
     output_dim=config.output_dim,        # Output dimension (e.g., 1 for closing price)
     timestamp_vocab_size=None            # Optional, set if you use timestamp embeddings
 )
-model = model.to(device)
+model = model.to(device) # Move model to the selected device
 print(f"EnhancedLFTSformer model initialized with feature_dim={actual_feature_dim} and moved to device.")
 
 # Synchronize the prediction horizon. Use the model's actual prediction length.
@@ -256,7 +261,7 @@ print("Imported optimizer (GCAdam) and loss function (DynamicLossFunction).")
 # Initialize loss function FIRST
 print("Initializing DynamicLossFunction.")
 loss_function = DynamicLossFunction(beta_initial=config.beta_initial, c=config.c)
-loss_function = loss_function.to(device)
+loss_function = loss_function.to(device) # Move loss function to device
 print("DynamicLossFunction initialized and moved to device.")
 
 # THEN initialize optimizer with loss function parameters
@@ -272,11 +277,12 @@ print("Optimizer (GCAdam) initialized.")
 def log_memory_usage():
     process = psutil.Process(os.getpid())
     print(f"Memory usage: {process.memory_info().rss/1e6:.2f} MB")
-    if torch.backends.mps.is_available():
+    if device.type == 'mps': # Only relevant for MPS
         print(f"MPS Memory: {torch.mps.current_allocated_memory()/1e6:.2f} MB")
     # Force garbage collection
     gc.collect()
-    torch.mps.empty_cache()
+    if device.type == 'mps': # Only relevant for MPS
+        torch.mps.empty_cache()
 
 # ---------------------------
 # VI. Model Training
@@ -295,7 +301,7 @@ trained_model, training_history = train_model(
     loss_function=loss_function,
     optimizer=optimizer,
     epochs=config.epochs,
-    device=device,
+    device=device,  # Pass the device to the training function
     early_stopping_patience=config.early_stopping_patience
 )
 print("Model training completed.")
@@ -321,8 +327,8 @@ print("Starting model evaluation.")
 with torch.no_grad():
     for batch in test_dataloader:
         inputs, labels = batch
-        inputs = inputs.to(device)
-        labels = labels.to(device)
+        inputs = inputs.to(device)  # Move inputs to device
+        labels = labels.to(device)  # Move labels to device
         outputs = trained_model(inputs)
         all_true.append(labels.cpu().numpy())
         all_preds.append(outputs.cpu().numpy())
@@ -397,7 +403,7 @@ print("Feature extraction data cached.")
 
 if __name__ == "__main__":
     # M1/MPS specific initialization
-    if torch.backends.mps.is_available():
+    if device.type == 'mps': # Only relevant for MPS
         torch.mps.set_per_process_memory_fraction(0.5)  # Limit memory usage if needed
     
     def main():
@@ -405,4 +411,5 @@ if __name__ == "__main__":
         print("Experiment completed successfully.")
     
     main()
-    torch.mps.empty_cache()  # Final cleanup 
+    if device.type == 'mps': # Only relevant for MPS
+        torch.mps.empty_cache()  # Final cleanup 

@@ -85,8 +85,9 @@ def fetch_data(ticker, api_key, rate_limiter, start_date=None, end_date=None):
         "Authorization": f"Bearer {api_key}"
     }
     
-    # Add retry counter
-    max_retries = 3  # Maximum number of retry attempts per chunk
+    # Updated configuration: allow only 2 retries per chunk and track failed date ranges.
+    max_retries = 2  # Maximum number of retry attempts per chunk (changed from 3 to 2)
+    failed_chunks = 0  # Counter for failed date ranges for this ticker
     
     # Start with smaller chunks for recent data, then use larger chunks for older data
     while current_date <= end_datetime:
@@ -94,13 +95,12 @@ def fetch_data(ticker, api_key, rate_limiter, start_date=None, end_date=None):
         chunk_size = None  # Initialize chunk_size
         
         while True:  # Inner loop for retries
-            # Use 7-day chunks for the most recent month, 30-day chunks for older data
+            # Determine chunk size: use 7-day chunks for recent month, else 90 days (unless reduced)
             days_from_end = (end_datetime - current_date).days
-            chunk_size = 7 if days_from_end <= 30 else 30 if chunk_size is None else chunk_size
+            chunk_size = 7 if days_from_end <= 30 else 150 if chunk_size is None else chunk_size
             chunk_end = min(current_date + timedelta(days=chunk_size), end_datetime)
             
             log_msg = f"Processing {current_date.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}"
-            print(log_msg)
             print(log_msg)
             
             url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{current_date.strftime('%Y-%m-%d')}/{chunk_end.strftime('%Y-%m-%d')}"
@@ -146,26 +146,34 @@ def fetch_data(ticker, api_key, rate_limiter, start_date=None, end_date=None):
             
             log_msg = f"Retrieved {total_records} total records for current chunk"
             print(log_msg)
-            print(log_msg)
+            
+            # If no data was received, try reducing the chunk size up to max_retries
             if total_records == 0 and chunk_size > 1 and retry_attempts < max_retries:
                 log_msg = f"No data received. Reducing chunk size (attempt {retry_attempts+1}/{max_retries})..."
                 logging.warning(log_msg)
-                print(log_msg)
                 chunk_size = max(1, chunk_size // 2)
                 retry_attempts += 1
                 continue
                 
-            # If still no data after retries, break and move on
+            # If still no data after retrying twice, count this failed date range
             if total_records == 0 and retry_attempts >= max_retries:
-                log_msg = f"No data after {max_retries} attempts. Moving to next date chunk."
+                log_msg = (f"No data after {max_retries} attempts for date range "
+                           f"{current_date.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}. "
+                           "Moving to next date chunk.")
                 logging.warning(log_msg)
-                print(log_msg)
+                failed_chunks += 1
+                # If two different date ranges have failed, move on to the next ticker
+                if failed_chunks >= 2:
+                    log_msg = f"Encountered failures in two different date ranges for {ticker}. Aborting further data fetch for this ticker."
+                    logging.warning(log_msg)
+                    return  # Abort fetching data for this ticker
                 current_date = chunk_end + timedelta(days=1)
-                break
-                
-            # If we have data or exhausted retries, move forward
+                break  # Proceed to next date chunk
+            
+            # If data was successfully fetched, move forward in the date range
             current_date = chunk_end + timedelta(days=1)
-            break  # Exit retry loop
+            break  # Exit retry loop for the current chunk
+
     print(f"Data fetching completed for ticker: {ticker}.")
 
 def save_to_csv(ticker, data):
@@ -299,41 +307,34 @@ def main():
     for i, ticker in enumerate(TICKERS):
         log_msg = f"\n🔍 [{i+1}/{len(TICKERS)}] Checking {ticker}"
         print(log_msg)
-        print(log_msg)
-        
+
+        # Validate ticker's active status BEFORE any further processing.
         if not validate_ticker(ticker, api_key, rate_limiter):
-            log_msg = f"⏩ Skipping {ticker}"
+            log_msg = f"⏩ Ticker {ticker} is not active. Skipping."
             print(log_msg)
             print(log_msg)
             continue
-            
+
         last_dt = get_last_datetime_from_csv(ticker)
-        
         if last_dt:
-            # Check if last data point is more than 168 hours (1 week) old
+            # Check if the data is up to date (i.e. within the past 168 hours)
             time_since_last = datetime.now() - last_dt
             hours_old = time_since_last.total_seconds() / 3600
-            if time_since_last.total_seconds() < 168 * 3600:  # 168 hours in seconds
-                log_msg = f"Data is recent (last update: {last_dt.strftime('%Y-%m-%d %H:%M:%S')}, {hours_old:.1f} hours old). Skipping {ticker}"
+            if time_since_last.total_seconds() < 168 * 3600:
+                log_msg = (f"Data is recent (last update: {last_dt.strftime('%Y-%m-%d %H:%M:%S')}, "
+                           f"{hours_old:.1f} hours old). Skipping {ticker}.")
                 print(log_msg)
                 print(log_msg)
                 continue
-                
+            # Increment last_dt to resume fetching from the minute after the last record.
             last_dt = last_dt + timedelta(minutes=1)
             fetch_start = last_dt.strftime("%Y-%m-%d")
-            log_msg = f"Data is old (last update: {last_dt.strftime('%Y-%m-%d %H:%M:%S')}, {hours_old:.1f} hours old)"
-            print(log_msg)
-            print(log_msg)
-            log_msg = f"Fetching new data from {fetch_start} to {END_DATE}"
-            print(log_msg)
+            log_msg = (f"Data is outdated (last update: {last_dt.strftime('%Y-%m-%d %H:%M:%S')}, "
+                       f"{hours_old:.1f} hours old). Fetching new data from {fetch_start} to {END_DATE}.")
             print(log_msg)
         else:
             fetch_start = START_DATE
-            log_msg = f"No existing data for {ticker}"
-            print(log_msg)
-            print(log_msg)
-            log_msg = f"Fetching full history from {fetch_start} to {END_DATE}"
-            print(log_msg)
+            log_msg = f"No existing data for {ticker}. Fetching full history from {fetch_start} to {END_DATE}."
             print(log_msg)
 
         fetch_data(ticker, api_key, rate_limiter, start_date=fetch_start, end_date=END_DATE)
@@ -341,11 +342,9 @@ def main():
         completion_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_msg = f"Completed processing {ticker} at {completion_time}"
         print(log_msg)
-        print(log_msg)
 
     completion_all_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     log_msg = f"\nCompleted all processing at {completion_all_time}"
-    print(log_msg)
     print(log_msg)
     print("Data fetcher main function completed.")
 

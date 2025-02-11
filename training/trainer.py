@@ -29,9 +29,11 @@ def train_epoch(model, dataloader, loss_function, optimizer, device, gradient_cl
         inputs, targets = batch
         inputs = inputs.to(device)
         targets = targets.to(device)
-        
+
         optimizer.zero_grad()
         outputs = model(inputs)
+        # Squeeze the output to match the target shape
+        outputs = outputs.squeeze(-1)  # [batch_size, pred_len, 1] -> [batch_size, pred_len]
         loss = loss_function(outputs, targets)
 
         # Check if loss is NaN, and if so, skip this batch update with a warning.
@@ -41,7 +43,7 @@ def train_epoch(model, dataloader, loss_function, optimizer, device, gradient_cl
             continue
 
         loss.backward()
-        
+
         # Apply gradient clipping and compute gradient norm
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_value)
         total_grad_norm += grad_norm
@@ -73,6 +75,8 @@ def validate_epoch(model, dataloader, loss_function, device):
             inputs = inputs.to(device)
             targets = targets.to(device)
             outputs = model(inputs)
+            # Squeeze the output to match the target shape
+            outputs = outputs.squeeze(-1) # [batch_size, pred_len, 1] -> [batch_size, pred_len]
             loss = loss_function(outputs, targets)
             val_loss += loss.item() * inputs.size(0)
             all_preds.append(outputs.detach().cpu())
